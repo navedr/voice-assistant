@@ -6,6 +6,7 @@ Uses: Groq (STT), OpenAI (AI), Google Cloud Wavenet (TTS)
 
 import os
 import io
+import json
 import wave
 import time
 import pyaudio
@@ -13,9 +14,19 @@ import tempfile
 import struct
 import math
 import subprocess
+import logging
 from groq import Groq
 from openai import OpenAI
 from google.cloud import texttospeech
+
+logging.basicConfig(
+    format="%(asctime)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("beans")
+log.setLevel(logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # Configuration
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
@@ -29,6 +40,8 @@ CHUNK_SIZE = 1024
 CHANNELS = 1
 SILENCE_THRESHOLD = 500
 SILENCE_DURATION = 2.0
+HISTORY_FILE = os.environ.get("HISTORY_FILE", "/app/data/history.json")
+MAX_HISTORY_PAIRS = 5
 
 # M4: Adaptive threshold constants
 MAX_WAKE_WORDS = 20
@@ -98,11 +111,11 @@ def retry_api_call(fn, max_retries=2, delay=1.0):
         except Exception as e:
             last_exception = e
             if attempt < max_retries:
-                print(f"  retry {attempt + 1}/{max_retries} after error: {e}")
+                log.warning(f"  retry {attempt + 1}/{max_retries} after error: {e}")
                 time.sleep(current_delay)
                 current_delay *= 2
             else:
-                print(f"  all {max_retries} retries exhausted: {e}")
+                log.warning(f"  all {max_retries} retries exhausted: {e}")
     raise last_exception
 
 
@@ -125,7 +138,7 @@ def find_audio_device():
 class VoiceAssistant:
     def __init__(self):
         self.audio = pyaudio.PyAudio()
-        self.conversation_history = []
+        self.conversation_history = self._load_history()
         self.device = find_audio_device()
         self.last_interaction_time = time.time()
         self.current_threshold = SILENCE_THRESHOLD
@@ -135,13 +148,29 @@ class VoiceAssistant:
         try:
             self.tts_client = texttospeech.TextToSpeechClient()
         except Exception as e:
-            print(f"⚠️  Google TTS unavailable ({e}), using espeak fallback")
+            log.warning("Google TTS unavailable (%s), using espeak fallback", e)
             self.tts_client = None
 
-        print(f"🎙️  Voice Assistant initialized")
-        print(f"Wake word: '{WAKE_WORD}'")
-        print(f"Audio device: {self.device}")
+        log.info(f"🎙️  Voice Assistant initialized")
+        log.info(f"Wake word: '{WAKE_WORD}'")
+        log.info(f"Audio device: {self.device}")
         self._startup_self_test()
+
+    def _load_history(self):
+        try:
+            with open(HISTORY_FILE, 'r') as f:
+                history = json.load(f)
+                log.info(f"Loaded {len(history)} messages from history")
+                return history
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+
+    def _save_history(self):
+        os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
+        # Keep last N pairs (2 messages per pair)
+        history = self.conversation_history[-(MAX_HISTORY_PAIRS * 2):]
+        with open(HISTORY_FILE, 'w') as f:
+            json.dump(history, f, indent=2)
 
     def _startup_self_test(self):
         try:
@@ -152,9 +181,9 @@ class VoiceAssistant:
             stream.read(CHUNK_SIZE, exception_on_overflow=False)
             stream.stop_stream()
             stream.close()
-            print("✅ Audio self-test passed")
+            log.info("✅ Audio self-test passed")
         except Exception as e:
-            print(f"❌ Audio self-test FAILED: {e}")
+            log.error(f" Audio self-test FAILED: {e}")
         self.speak(f"{ASSISTANT_NAME} is ready!")
 
     def flush_mic(self, duration=0.5):
@@ -210,8 +239,6 @@ class VoiceAssistant:
         return False
 
     def detect_wake_word(self):
-        print(f"\n👂 Listening for '{WAKE_WORD}'...")
-
         try:
             stream = self.audio.open(
                 format=pyaudio.paInt16, channels=CHANNELS,
@@ -219,14 +246,16 @@ class VoiceAssistant:
             )
         except OSError:
             # Audio device may have changed — try to re-detect
-            print("⚠️  Audio device error, re-detecting...")
+            log.warning(" Audio device error, re-detecting...")
             self.device = find_audio_device()
-            print(f"Audio device: {self.device}")
+            log.info(f"Audio device: {self.device}")
             return False
 
         # M4: Adaptive threshold from ambient noise
         self.current_threshold = self.calibrate_noise_floor(stream, duration=1.0)
 
+        pre_buffer = []  # Rolling buffer to capture audio before threshold crossed
+        pre_buffer_size = int(0.5 * SAMPLE_RATE / CHUNK_SIZE)  # ~0.5 seconds
         frames = []
         recording_started = False
         silence_frames = 0
@@ -240,7 +269,14 @@ class VoiceAssistant:
 
                 if rms > self.current_threshold and not recording_started:
                     recording_started = True
-                    frames = []
+                    # Include pre-buffer so we don't clip the start of speech
+                    frames = list(pre_buffer)
+
+                if not recording_started:
+                    # Keep a rolling buffer of recent audio
+                    pre_buffer.append(data)
+                    if len(pre_buffer) > pre_buffer_size:
+                        pre_buffer.pop(0)
 
                 if recording_started:
                     frames.append(data)
@@ -285,18 +321,18 @@ class VoiceAssistant:
 
                 if text in HALLUCINATIONS or len(text.strip(".,!? ")) < 3:
                     return False
-                print(f"Heard: {text}")
+                log.info(f"Heard: {text}")
 
                 # M4: Fuzzy wake word check
                 return self.is_wake_word(text)
             except Exception as e:
-                print(f"Transcription error: {e}")
+                log.warning(f"Transcription error: {e}")
                 return False
             finally:
                 os.unlink(f.name)
 
     def record_command(self, max_seconds=7):
-        print("🎤 Listening for command...")
+        log.info("🎤 Listening for command...")
 
         try:
             stream = self.audio.open(
@@ -304,11 +340,12 @@ class VoiceAssistant:
                 rate=SAMPLE_RATE, input=True, frames_per_buffer=CHUNK_SIZE
             )
         except OSError:
-            print("⚠️  Audio device error, re-detecting...")
+            log.warning(" Audio device error, re-detecting...")
             self.device = find_audio_device()
             return None
 
         frames = []
+        recording_started = False
         silence_frames = 0
         max_recording_frames = int(max_seconds * SAMPLE_RATE / CHUNK_SIZE)
 
@@ -316,9 +353,17 @@ class VoiceAssistant:
             frame_count = 0
             while frame_count < max_recording_frames:
                 data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
-                frames.append(data)
                 rms = self.get_rms(data)
                 frame_count += 1
+
+                # Wait for speech to start before recording
+                if not recording_started:
+                    if rms > self.current_threshold:
+                        recording_started = True
+                        frames = []
+                    continue
+
+                frames.append(data)
 
                 if rms < self.current_threshold:
                     silence_frames += 1
@@ -356,9 +401,9 @@ class VoiceAssistant:
 
                 transcription = retry_api_call(transcribe)
                 command = transcription.text.strip()
-                print(f"Command: {command}")
+                log.info(f"Command: {command}")
             except Exception as e:
-                print(f"Transcription error: {e}")
+                log.warning(f"Transcription error: {e}")
                 command = None
             finally:
                 os.unlink(f.name)
@@ -366,7 +411,7 @@ class VoiceAssistant:
         return command
 
     def get_ai_response(self, user_message):
-        print("🤖 Thinking...")
+        log.info("🤖 Thinking...")
 
         self.conversation_history.append({
             "role": "user", "content": user_message
@@ -401,18 +446,19 @@ class VoiceAssistant:
                 "role": "assistant", "content": reply
             })
 
-            # M6: Keep last 6 pairs (12 messages)
-            if len(self.conversation_history) > 12:
-                self.conversation_history = self.conversation_history[-12:]
+            # Keep last N pairs
+            if len(self.conversation_history) > MAX_HISTORY_PAIRS * 2:
+                self.conversation_history = self.conversation_history[-(MAX_HISTORY_PAIRS * 2):]
+            self._save_history()
 
-            print(f"Response: {reply}")
+            log.info(f"Response: {reply}")
             return reply
         except Exception as e:
-            print(f"AI error: {e}")
+            log.warning(f"AI error: {e}")
             return "I'm having trouble connecting right now."
 
     def speak(self, text):
-        print(f"🔊 Speaking: {text}")
+        log.info(f"🔊 Speaking: {text}")
         self.is_speaking = True
 
         if self.tts_client:
@@ -442,7 +488,7 @@ class VoiceAssistant:
                 self.is_speaking = False
                 return
             except Exception as e:
-                print(f"Google TTS error: {e}, falling back to espeak")
+                log.warning(f"Google TTS error: {e}, falling back to espeak")
 
         # espeak fallback
         clean = text.replace('"', '\\"').replace("'", "\\'")
@@ -453,19 +499,20 @@ class VoiceAssistant:
         self.is_speaking = False
 
     def run(self):
-        print("\n" + "=" * 50)
-        print(f"✅ {ASSISTANT_NAME} Ready!")
-        print(f"Say '{WAKE_WORD}' to activate")
-        print("Press Ctrl+C to exit")
-        print("=" * 50 + "\n")
+        log.info("\n" + "=" * 50)
+        log.info(f"✅ {ASSISTANT_NAME} Ready!")
+        log.info(f"Say '{WAKE_WORD}' to activate")
+        log.info("Press Ctrl+C to exit")
+        log.info("=" * 50 + "\n")
 
         try:
             while True:
                 # M2: Session timeout — clear stale history
                 if time.time() - self.last_interaction_time > 300:
                     if self.conversation_history:
-                        print("Session timeout — clearing conversation history")
+                        log.info("Session timeout — clearing conversation history")
                         self.conversation_history = []
+                        self._save_history()
 
                 result = self.detect_wake_word()
                 if result:
@@ -492,11 +539,11 @@ class VoiceAssistant:
                         # M2: Conversation mode — listen for follow-ups
                         while True:
                             self.flush_mic()  # Discard echo of TTS playback
-                            print("👂 Listening for follow-up (5s)...")
-                            follow_up = self.record_command(max_seconds=5)
+                            log.info("👂 Listening for follow-up (5s)...")
+                            follow_up = self.record_command(max_seconds=8)
 
                             if not follow_up:
-                                print("No follow-up, returning to wake word")
+                                log.info("No follow-up, returning to wake word")
                                 break
 
                             follow_lower = follow_up.lower().strip().strip(".,!?")
@@ -533,18 +580,18 @@ class VoiceAssistant:
                         self.speak("I'm here if you need me!")
 
         except KeyboardInterrupt:
-            print("\n\n👋 Shutting down...")
+            log.info("\n\n👋 Shutting down...")
         finally:
             self.audio.terminate()
 
 
 if __name__ == "__main__":
     if not GROQ_API_KEY:
-        print("❌ Error: GROQ_API_KEY not set")
+        log.error("GROQ_API_KEY not set")
         exit(1)
 
     if not OPENAI_API_KEY:
-        print("❌ Error: OPENAI_API_KEY not set")
+        log.error("OPENAI_API_KEY not set")
         exit(1)
 
     assistant = VoiceAssistant()

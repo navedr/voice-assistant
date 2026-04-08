@@ -18,6 +18,7 @@ services:
 
     volumes:
       - ./gcp-key.json:/app/gcp-key.json:ro
+      - ./data:/app/data
 
     # Logging configuration to prevent log buildup
     logging:
