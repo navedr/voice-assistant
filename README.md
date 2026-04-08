@@ -1,196 +1,140 @@
 # Voice Assistant for Raspberry Pi 3
 
-A voice-activated AI assistant using:
-- **Jabra Speak 510** for audio I/O
-- **Groq** for speech-to-text (Whisper)
-- **Claude** for AI responses
-- **Google TTS** or **espeak** for text-to-speech
+A voice-activated AI assistant for kids, running on a Raspberry Pi with a USB speaker.
 
-## Hardware Requirements
+## Stack
+
+- **Groq Whisper** — speech-to-text (free tier)
+- **OpenAI GPT-4.1** — AI responses
+- **Google Cloud Wavenet** — text-to-speech (4M chars/month free)
+- **espeak** — TTS fallback (offline)
+
+## Hardware
 
 - Raspberry Pi 3 (or newer)
-- Jabra Speak 510 USB speakerphone
-- Internet connection
+- Jabra Speak 510/750 USB speakerphone (auto-detected)
+- WiFi connection
 
-## Setup Instructions
+## Features
 
-### 1. Install System Dependencies
+- Configurable wake word and assistant name via `ASSISTANT_NAME` env var
+- Fuzzy wake word matching (handles mispronunciations, accents)
+- Conversation mode — follow-up questions without repeating the wake word
+- Cancel/stop phrases ("never mind", "cancel", "stop")
+- Adaptive silence threshold (calibrates to ambient noise)
+- Network retry with exponential backoff on all API calls
+- Self-hearing prevention (mic flush after TTS playback)
+- Audio pre-buffer to prevent clipping the start of speech
+- Conversation history persisted to JSON across restarts
+- Kid-friendly responses (simple language, no markdown)
+- Auto-detects USB audio device (no hardcoded card numbers)
+- Falls back to espeak if Google TTS credentials are missing
 
-```bash
-sudo apt-get update
-sudo apt-get install -y \
-    python3-pip \
-    python3-pyaudio \
-    portaudio19-dev \
-    espeak \
-    mpg123 \
-    alsa-utils
-```
+## Deployment (Docker)
 
-### 2. Configure Jabra Speak 510
+### Prerequisites
 
-Plug in your Jabra Speak 510 and verify it's detected:
+- Docker with buildx on your build machine
+- Docker on the Raspberry Pi
+- A local Docker registry (or modify `deploy.sh` for Docker Hub)
 
-```bash
-arecord -l   # List capture devices
-aplay -l     # List playback devices
-```
-
-Find your Jabra device number and set it as default:
-
-```bash
-# Test recording
-arecord -D plughw:1,0 -d 5 test.wav
-aplay test.wav
-
-# Test playback
-speaker-test -D plughw:1,0 -c2
-```
-
-### 3. Install Python Dependencies
+### 1. Configure API keys on the Pi
 
 ```bash
-cd /app/pi-voice-assistant
-pip3 install -r requirements.txt
+ssh pi@raspberrypi.local
+mkdir -p ~/docker/voice-assistant
+cd ~/docker/voice-assistant
 ```
-
-### 4. Configure API Keys
 
 Create a `.env` file:
-
 ```bash
-export GROQ_API_KEY="your_groq_api_key"
-export ANTHROPIC_API_KEY="your_anthropic_api_key"
-# Optional for Google TTS (or use espeak fallback)
-export GOOGLE_API_KEY="your_google_api_key"
+GROQ_API_KEY=your_groq_api_key
+OPENAI_API_KEY=your_openai_api_key
+ASSISTANT_NAME=Opal
 ```
 
-Load environment:
+Copy your Google Cloud service account key:
 ```bash
-source .env
+# From your build machine:
+scp your-gcp-key.json pi@raspberrypi.local:~/docker/voice-assistant/gcp-key.json
 ```
 
-### 5. Run the Assistant
+### 2. Build and push
+
+On your build machine:
+```bash
+./deploy.sh
+```
+
+This builds an ARM32v7 image and pushes to the registry.
+
+### 3. Deploy on the Pi
 
 ```bash
-python3 voice_assistant.py
+scp docker-compose.yml pi@raspberrypi.local:~/docker/voice-assistant/
+ssh pi@raspberrypi.local
+cd ~/docker/voice-assistant
+docker compose pull
+docker compose up -d
+```
+
+### 4. Check logs
+
+```bash
+docker logs -f beans
 ```
 
 ## Usage
 
-1. Wait for "Voice Assistant ready!"
-2. Say **"Hey Jarvis"** to activate
-3. Wait for the beep/response
-4. Speak your command
-5. Assistant will respond
+1. Wait for "{name} is ready!" announcement
+2. Say the wake word (e.g., "Hey Opal") or just the name ("Opal")
+3. Hear the activation chime
+4. Speak your question
+5. Get a response — then ask follow-ups without repeating the wake word
+6. After ~8 seconds of silence, returns to wake word listening
 
-## Customization
+### Cancel/Exit
 
-### Change Wake Word
+- Say "never mind", "cancel", or "stop" to cancel a command
+- Say "bye", "that's all", or "I'm done" to exit conversation mode
 
-Edit `voice_assistant.py`:
-```python
-WAKE_WORD = "hey jarvis"  # Change to your preferred wake word
-```
+## Configuration
 
-### Adjust Sensitivity
+All configuration is via environment variables in `.env`:
 
-```python
-SILENCE_THRESHOLD = 500  # Lower = more sensitive
-SILENCE_DURATION = 2.0   # Seconds of silence to end recording
-```
-
-### Use Different TTS
-
-**Option 1: espeak (lightweight, works offline)**
-```python
-def speak(self, text):
-    os.system(f'espeak "{text}"')
-```
-
-**Option 2: Piper (better quality, local)**
-```bash
-# Install Piper
-wget https://github.com/rhasspy/piper/releases/download/v1.2.0/piper_arm64.tar.gz
-tar -xzf piper_arm64.tar.gz
-
-# Download voice
-wget https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx
-```
-
-```python
-def speak(self, text):
-    os.system(f'echo "{text}" | ./piper --model en_US-lessac-medium.onnx --output-raw | aplay -r 22050 -f S16_LE')
-```
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GROQ_API_KEY` | (required) | Groq API key for Whisper STT |
+| `OPENAI_API_KEY` | (required) | OpenAI API key for GPT |
+| `ASSISTANT_NAME` | `Beans` | Assistant name and wake word |
+| `AUDIO_DEVICE` | (auto-detect) | ALSA device override, e.g. `plughw:2,0` |
+| `HISTORY_FILE` | `/app/data/history.json` | Path to conversation history |
 
 ## Troubleshooting
 
-### No audio input detected
+### No audio / device not found
 ```bash
-# Check ALSA configuration
-arecord -L
-# Set default device in ~/.asoundrc
+# Check USB speaker is connected
+docker exec beans arecord -l
+docker exec beans aplay -l
 ```
 
-### Groq API errors
-- Check your API key
-- Verify internet connection
-- Check Groq API status
+### Wake word not detected
+- Speak clearly within 1-2 feet of the speaker
+- Check logs for "Heard:" lines to see what Whisper transcribes
+- The assistant handles variations like "hey {name}", "hay {name}", just "{name}"
 
-### High CPU usage
-- Use smaller Groq model (if available)
-- Increase SILENCE_THRESHOLD
-- Reduce SAMPLE_RATE to 8000
+### No TTS audio output
+- Verify Google Cloud credentials: `gcp-key.json` must be mounted
+- Falls back to espeak automatically if Google TTS fails
+- Check `AUDIO_DEVICE` env var if using a non-Jabra USB speaker
 
-## Running on Boot
-
-Create systemd service:
-
+### Registry connection error
+Add insecure registry on the Pi:
 ```bash
-sudo nano /etc/systemd/system/voice-assistant.service
+echo '{"insecure-registries":["YOUR_REGISTRY:PORT"]}' | sudo tee /etc/docker/daemon.json
+sudo systemctl restart docker
 ```
-
-```ini
-[Unit]
-Description=Voice Assistant
-After=network.target sound.target
-
-[Service]
-Type=simple
-User=pi
-WorkingDirectory=/app/pi-voice-assistant
-Environment="GROQ_API_KEY=your_key"
-Environment="ANTHROPIC_API_KEY=your_key"
-ExecStart=/usr/bin/python3 /app/pi-voice-assistant/voice_assistant.py
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Enable:
-```bash
-sudo systemctl enable voice-assistant
-sudo systemctl start voice-assistant
-```
-
-## Performance Tips
-
-1. **Disable GUI** (if not needed):
-   ```bash
-   sudo systemctl set-default multi-user.target
-   ```
-
-2. **Overclock Pi 3** (optional):
-   Edit `/boot/config.txt`:
-   ```
-   arm_freq=1350
-   over_voltage=4
-   ```
-
-3. **Use lightweight TTS** (espeak instead of Google)
-
-4. **Batch requests** if making multiple API calls
 
 ## License
 
