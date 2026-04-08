@@ -231,10 +231,9 @@ class VoiceAssistant:
         normalized = text.replace(",", "").replace("!", "").replace(".", "")
         for check in (text, normalized):
             for variation in sorted(WAKE_VARIATIONS, key=len, reverse=True):
-                if check == variation:
-                    return True
-                if check.startswith(variation):
-                    after = check[len(variation):].strip().strip(".,!?")
+                if variation in check:
+                    # Extract everything after the wake word
+                    after = check.split(variation, 1)[1].strip().strip(".,!?")
                     return after if after else True
         return False
 
@@ -255,7 +254,7 @@ class VoiceAssistant:
         self.current_threshold = self.calibrate_noise_floor(stream, duration=1.0)
 
         pre_buffer = []  # Rolling buffer to capture audio before threshold crossed
-        pre_buffer_size = int(0.5 * SAMPLE_RATE / CHUNK_SIZE)  # ~0.5 seconds
+        pre_buffer_size = int(1.0 * SAMPLE_RATE / CHUNK_SIZE)  # ~1 second
         frames = []
         recording_started = False
         silence_frames = 0
