@@ -1,0 +1,6 @@
+*.md
+__pycache__
+*.pyc
+.git
+.env*
+gcp-*.json

@@ -1,0 +1,4 @@
+pyaudio>=0.2.13
+groq>=0.4.0
+openai>=1.12.0
+google-cloud-texttospeech>=2.14.0

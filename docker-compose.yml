@@ -1,0 +1,27 @@
+services:
+  beans:
+    image: 192.168.68.168:3030/pi-voice-assistant:latest
+    container_name: beans
+    restart: unless-stopped
+
+    # Audio device access for Jabra Speak 510
+    devices:
+      - /dev/snd:/dev/snd
+
+    # API Keys - set these in .env file or export before running
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ASSISTANT_NAME=${ASSISTANT_NAME:-Beans}
+      - AUDIO_DEVICE=${AUDIO_DEVICE:-}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-key.json
+
+    volumes:
+      - ./gcp-key.json:/app/gcp-key.json:ro
+
+    # Logging configuration to prevent log buildup
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
