@@ -45,9 +45,9 @@ MAX_HISTORY_PAIRS = 5
 
 # M4: Adaptive threshold constants
 MAX_WAKE_WORDS = 20
-NOISE_FLOOR_MIN = 300
+NOISE_FLOOR_MIN = 200
 NOISE_FLOOR_MAX = 1500
-NOISE_FLOOR_MULTIPLIER = 3
+NOISE_FLOOR_MULTIPLIER = 2
 
 # Whisper hallucinates these on silence/noise
 HALLUCINATIONS = {
@@ -173,6 +173,14 @@ class VoiceAssistant:
             json.dump(history, f, indent=2)
 
     def _startup_self_test(self):
+        # Set USB speaker volume to max
+        try:
+            card = self.device.split(":")[1].split(",")[0] if ":" in self.device else "1"
+            subprocess.run(["amixer", "-c", card, "sset", "PCM", "90%"], capture_output=True)
+            log.info("🔊 Speaker volume set to max")
+        except Exception:
+            pass
+
         try:
             stream = self.audio.open(
                 format=pyaudio.paInt16, channels=CHANNELS,
@@ -252,6 +260,7 @@ class VoiceAssistant:
 
         # M4: Adaptive threshold from ambient noise
         self.current_threshold = self.calibrate_noise_floor(stream, duration=1.0)
+        log.info(f"👂 Listening (threshold: {self.current_threshold})")
 
         pre_buffer = []  # Rolling buffer to capture audio before threshold crossed
         pre_buffer_size = int(1.0 * SAMPLE_RATE / CHUNK_SIZE)  # ~1 second
@@ -260,11 +269,15 @@ class VoiceAssistant:
         silence_frames = 0
         max_recording_frames = int(5 * SAMPLE_RATE / CHUNK_SIZE)
 
+        max_wait_frames = int(10 * SAMPLE_RATE / CHUNK_SIZE)  # Max 10s waiting for speech
+
         try:
             frame_count = 0
+            total_frames = 0
             while frame_count < max_recording_frames:
                 data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
                 rms = self.get_rms(data)
+                total_frames += 1
 
                 if rms > self.current_threshold and not recording_started:
                     recording_started = True
@@ -276,18 +289,21 @@ class VoiceAssistant:
                     pre_buffer.append(data)
                     if len(pre_buffer) > pre_buffer_size:
                         pre_buffer.pop(0)
-
-                if recording_started:
-                    frames.append(data)
-                    frame_count += 1
-
-                    if rms < self.current_threshold:
-                        silence_frames += 1
-                    else:
-                        silence_frames = 0
-
-                    if silence_frames > int(SILENCE_DURATION * SAMPLE_RATE / CHUNK_SIZE):
+                    # Timeout if no speech detected
+                    if total_frames >= max_wait_frames:
                         break
+                    continue
+
+                frames.append(data)
+                frame_count += 1
+
+                if rms < self.current_threshold:
+                    silence_frames += 1
+                else:
+                    silence_frames = 0
+
+                if silence_frames > int(SILENCE_DURATION * SAMPLE_RATE / CHUNK_SIZE):
+                    break
         finally:
             stream.stop_stream()
             stream.close()
