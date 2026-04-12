@@ -1,6 +1,6 @@
 services:
   beans:
-    image: ghcr.io/navedr/pi-voice-assistant:latest
+    image: 192.168.68.168:3030/pi-voice-assistant:latest
     container_name: beans
     restart: unless-stopped
 

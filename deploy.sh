@@ -4,7 +4,7 @@ set -e
 # Configuration
 IMAGE_NAME="pi-voice-assistant"
 TAG="latest"
-REGISTRY="ghcr.io/navedr"
+REGISTRY="192.168.68.168:3030"
 
 echo "=== Building and pushing Docker image for ARM32v7 (Raspberry Pi 3) ==="
 docker buildx build --platform linux/arm/v7 \
