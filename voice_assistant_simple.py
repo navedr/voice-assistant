@@ -45,9 +45,9 @@ MAX_HISTORY_PAIRS = 5
 
 # M4: Adaptive threshold constants
 MAX_WAKE_WORDS = 20
-NOISE_FLOOR_MIN = 200
+NOISE_FLOOR_MIN = 150
 NOISE_FLOOR_MAX = 1500
-NOISE_FLOOR_MULTIPLIER = 2
+NOISE_FLOOR_MULTIPLIER = 1.5
 
 # Whisper hallucinates these on silence/noise
 HALLUCINATIONS = {
@@ -360,33 +360,24 @@ class VoiceAssistant:
             return None
 
         frames = []
-        recording_started = False
+        speech_detected = False
         silence_frames = 0
         max_recording_frames = int(max_seconds * SAMPLE_RATE / CHUNK_SIZE)
+        silence_threshold = max(self.current_threshold, SILENCE_THRESHOLD)
 
         try:
-            frame_count = 0
-            while frame_count < max_recording_frames:
+            for _ in range(max_recording_frames):
                 data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
                 rms = self.get_rms(data)
-                frame_count += 1
-
-                # Wait for speech to start before recording
-                if not recording_started:
-                    if rms > self.current_threshold:
-                        recording_started = True
-                        frames = []
-                    continue
-
                 frames.append(data)
 
-                if rms < self.current_threshold:
-                    silence_frames += 1
-                else:
+                if rms > silence_threshold:
+                    speech_detected = True
                     silence_frames = 0
-
-                if silence_frames > int(SILENCE_DURATION * SAMPLE_RATE / CHUNK_SIZE):
-                    break
+                elif speech_detected:
+                    silence_frames += 1
+                    if silence_frames > int(1.5 * SAMPLE_RATE / CHUNK_SIZE):
+                        break  # 1.5s silence after speech = done talking
         finally:
             stream.stop_stream()
             stream.close()
@@ -448,7 +439,7 @@ class VoiceAssistant:
                     f'| aplay -D {self.device} 2>/dev/null'
                 )
             return openai_client.chat.completions.create(
-                model="gpt-4.1",
+                model="gpt-5.4-nano",
                 max_tokens=200,
                 messages=messages
             )
@@ -476,6 +467,28 @@ class VoiceAssistant:
         log.info(f"🔊 Speaking: {text}")
         self.is_speaking = True
 
+        # Try Groq TTS first (fastest)
+        try:
+            def call_groq_tts():
+                return groq_client.audio.speech.create(
+                    model="canopylabs/orpheus-v1-english",
+                    voice="hannah",
+                    input=text,
+                    response_format="wav"
+                )
+
+            response = retry_api_call(call_groq_tts)
+
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                response.write_to_file(f.name)
+                os.system(f"aplay -D {self.device} {f.name} 2>/dev/null")
+                os.unlink(f.name)
+            self.is_speaking = False
+            return
+        except Exception as e:
+            log.warning(f"Groq TTS error: {e}, trying Google TTS")
+
+        # Google Cloud TTS fallback
         if self.tts_client:
             try:
                 synthesis_input = texttospeech.SynthesisInput(text=text)
@@ -487,14 +500,13 @@ class VoiceAssistant:
                     sample_rate_hertz=24000,
                 )
 
-                def call_tts():
+                def call_google_tts():
                     return self.tts_client.synthesize_speech(
                         input=synthesis_input, voice=voice,
                         audio_config=audio_config
                     )
 
-                # M5: Retry TTS
-                response = retry_api_call(call_tts)
+                response = retry_api_call(call_google_tts)
 
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                     f.write(response.audio_content)
