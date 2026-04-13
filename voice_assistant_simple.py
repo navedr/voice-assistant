@@ -9,7 +9,14 @@ import io
 import json
 import wave
 import time
-import pyaudio
+
+# Load .env file if present (for local development)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+import platform
 import tempfile
 import struct
 import math
@@ -18,6 +25,16 @@ import logging
 from groq import Groq
 from openai import OpenAI
 from google.cloud import texttospeech
+
+# Audio input: pyaudio on Linux (Pi), sounddevice on macOS
+try:
+    import pyaudio
+    import pyaudio._portaudio  # verify C module loads
+    USE_SOUNDDEVICE = False
+except (ImportError, OSError):
+    import sounddevice as sd
+    import numpy as np
+    USE_SOUNDDEVICE = True
 
 logging.basicConfig(
     format="%(asctime)s %(message)s",
@@ -41,6 +58,7 @@ CHANNELS = 1
 SILENCE_THRESHOLD = 500
 SILENCE_DURATION = 2.0
 HISTORY_FILE = os.environ.get("HISTORY_FILE", "/app/data/history.json")
+MEMORY_FILE = os.environ.get("MEMORY_FILE", "/app/data/memory.json")
 MAX_HISTORY_PAIRS = 5
 
 # M4: Adaptive threshold constants
@@ -134,11 +152,14 @@ def find_audio_device():
         pass
     return "plughw:1,0"
 
+IS_MACOS = platform.system() == "Darwin"
+
 
 class VoiceAssistant:
     def __init__(self):
-        self.audio = pyaudio.PyAudio()
+        self.audio = None if USE_SOUNDDEVICE else pyaudio.PyAudio()
         self.conversation_history = self._load_history()
+        self.memories = self._load_memory()
         self.device = find_audio_device()
         self.last_interaction_time = time.time()
         self.current_threshold = SILENCE_THRESHOLD
@@ -172,6 +193,58 @@ class VoiceAssistant:
         with open(HISTORY_FILE, 'w') as f:
             json.dump(history, f, indent=2)
 
+    def _load_memory(self):
+        try:
+            with open(MEMORY_FILE, 'r') as f:
+                memories = json.load(f)
+                log.info(f"Loaded {len(memories)} memories")
+                return memories
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+
+    def _save_memory(self, memory):
+        memories = self._load_memory()
+        memories.append(memory)
+        os.makedirs(os.path.dirname(MEMORY_FILE), exist_ok=True)
+        with open(MEMORY_FILE, 'w') as f:
+            json.dump(memories, f, indent=2)
+
+    def _open_mic(self):
+        """Open mic stream — returns (stream, read_fn, close_fn)."""
+        if USE_SOUNDDEVICE:
+            buffer = []
+            def callback(indata, frames, time_info, status):
+                buffer.append(bytes(indata))
+            stream = sd.RawInputStream(
+                samplerate=SAMPLE_RATE, blocksize=CHUNK_SIZE,
+                channels=CHANNELS, dtype='int16', callback=callback
+            )
+            stream.start()
+            def read_chunk(_=None):
+                while not buffer:
+                    time.sleep(0.01)
+                return buffer.pop(0)
+            def close():
+                stream.stop()
+                stream.close()
+            return stream, read_chunk, close
+        else:
+            stream = self.audio.open(
+                format=pyaudio.paInt16, channels=CHANNELS,
+                rate=SAMPLE_RATE, input=True, frames_per_buffer=CHUNK_SIZE
+            )
+            def read_chunk(_=None):
+                return stream.read(CHUNK_SIZE, exception_on_overflow=False)
+            def close():
+                stream.stop_stream()
+                stream.close()
+            return stream, read_chunk, close
+
+    def _get_sample_width(self):
+        if USE_SOUNDDEVICE:
+            return 2  # int16 = 2 bytes
+        return self.audio.get_sample_size(pyaudio.paInt16)
+
     def _startup_self_test(self):
         # Set USB speaker volume to max
         try:
@@ -182,13 +255,9 @@ class VoiceAssistant:
             pass
 
         try:
-            stream = self.audio.open(
-                format=pyaudio.paInt16, channels=CHANNELS,
-                rate=SAMPLE_RATE, input=True, frames_per_buffer=CHUNK_SIZE,
-            )
-            stream.read(CHUNK_SIZE, exception_on_overflow=False)
-            stream.stop_stream()
-            stream.close()
+            _, read_fn, close_fn = self._open_mic()
+            read_fn()
+            close_fn()
             log.info("✅ Audio self-test passed")
         except Exception as e:
             log.error(f" Audio self-test FAILED: {e}")
@@ -197,20 +266,23 @@ class VoiceAssistant:
     def flush_mic(self, duration=0.5):
         """Discard buffered mic audio to prevent self-hearing."""
         try:
-            stream = self.audio.open(
-                format=pyaudio.paInt16, channels=CHANNELS,
-                rate=SAMPLE_RATE, input=True, frames_per_buffer=CHUNK_SIZE
-            )
+            _, read_fn, close_fn = self._open_mic()
             for _ in range(int(duration * SAMPLE_RATE / CHUNK_SIZE)):
-                stream.read(CHUNK_SIZE, exception_on_overflow=False)
-            stream.stop_stream()
-            stream.close()
+                read_fn()
+            close_fn()
         except Exception:
             pass
 
+    def _play_wav(self, path):
+        if IS_MACOS:
+            subprocess.run(["afplay", path], stderr=subprocess.DEVNULL)
+        else:
+            subprocess.run(["aplay", "-D", self.device, path], stderr=subprocess.DEVNULL)
+
     def play_beep(self):
         self.is_speaking = True
-        os.system(f"aplay -D {self.device} /app/activate.wav 2>/dev/null")
+        beep_path = "activate.wav" if IS_MACOS else "/app/activate.wav"
+        self._play_wav(beep_path)
         self.is_speaking = False
 
     def get_rms(self, data):
@@ -220,11 +292,11 @@ class VoiceAssistant:
         return math.sqrt(sum_squares / count)
 
     # M4: Adaptive noise calibration
-    def calibrate_noise_floor(self, stream, duration=1.0):
+    def calibrate_noise_floor(self, read_fn, duration=1.0):
         num_chunks = int(duration * SAMPLE_RATE / CHUNK_SIZE)
         total_rms = 0.0
         for _ in range(num_chunks):
-            data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+            data = read_fn()
             total_rms += self.get_rms(data)
         avg_rms = total_rms / max(num_chunks, 1)
         threshold = NOISE_FLOOR_MULTIPLIER * avg_rms
@@ -247,19 +319,15 @@ class VoiceAssistant:
 
     def detect_wake_word(self):
         try:
-            stream = self.audio.open(
-                format=pyaudio.paInt16, channels=CHANNELS,
-                rate=SAMPLE_RATE, input=True, frames_per_buffer=CHUNK_SIZE
-            )
+            _, read_fn, close_fn = self._open_mic()
         except OSError:
-            # Audio device may have changed — try to re-detect
             log.warning(" Audio device error, re-detecting...")
             self.device = find_audio_device()
             log.info(f"Audio device: {self.device}")
             return False
 
         # M4: Adaptive threshold from ambient noise
-        self.current_threshold = self.calibrate_noise_floor(stream, duration=1.0)
+        self.current_threshold = self.calibrate_noise_floor(read_fn, duration=1.0)
         log.info(f"👂 Listening (threshold: {self.current_threshold})")
 
         pre_buffer = []  # Rolling buffer to capture audio before threshold crossed
@@ -275,21 +343,18 @@ class VoiceAssistant:
             frame_count = 0
             total_frames = 0
             while frame_count < max_recording_frames:
-                data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                data = read_fn()
                 rms = self.get_rms(data)
                 total_frames += 1
 
                 if rms > self.current_threshold and not recording_started:
                     recording_started = True
-                    # Include pre-buffer so we don't clip the start of speech
                     frames = list(pre_buffer)
 
                 if not recording_started:
-                    # Keep a rolling buffer of recent audio
                     pre_buffer.append(data)
                     if len(pre_buffer) > pre_buffer_size:
                         pre_buffer.pop(0)
-                    # Timeout if no speech detected
                     if total_frames >= max_wait_frames:
                         break
                     continue
@@ -305,8 +370,7 @@ class VoiceAssistant:
                 if silence_frames > int(SILENCE_DURATION * SAMPLE_RATE / CHUNK_SIZE):
                     break
         finally:
-            stream.stop_stream()
-            stream.close()
+            close_fn()
 
         if not frames or len(frames) < 5:
             return False
@@ -315,7 +379,7 @@ class VoiceAssistant:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             wf = wave.open(f.name, 'wb')
             wf.setnchannels(CHANNELS)
-            wf.setsampwidth(self.audio.get_sample_size(pyaudio.paInt16))
+            wf.setsampwidth(self._get_sample_width())
             wf.setframerate(SAMPLE_RATE)
             wf.writeframes(b''.join(frames))
             wf.close()
@@ -350,10 +414,7 @@ class VoiceAssistant:
         log.info("🎤 Listening for command...")
 
         try:
-            stream = self.audio.open(
-                format=pyaudio.paInt16, channels=CHANNELS,
-                rate=SAMPLE_RATE, input=True, frames_per_buffer=CHUNK_SIZE
-            )
+            _, read_fn, close_fn = self._open_mic()
         except OSError:
             log.warning(" Audio device error, re-detecting...")
             self.device = find_audio_device()
@@ -367,7 +428,7 @@ class VoiceAssistant:
 
         try:
             for _ in range(max_recording_frames):
-                data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                data = read_fn()
                 rms = self.get_rms(data)
                 frames.append(data)
 
@@ -377,10 +438,9 @@ class VoiceAssistant:
                 elif speech_detected:
                     silence_frames += 1
                     if silence_frames > int(1.5 * SAMPLE_RATE / CHUNK_SIZE):
-                        break  # 1.5s silence after speech = done talking
+                        break
         finally:
-            stream.stop_stream()
-            stream.close()
+            close_fn()
 
         if not frames or len(frames) < 5:
             return None
@@ -389,7 +449,7 @@ class VoiceAssistant:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             wf = wave.open(f.name, 'wb')
             wf.setnchannels(CHANNELS)
-            wf.setsampwidth(self.audio.get_sample_size(pyaudio.paInt16))
+            wf.setsampwidth(self._get_sample_width())
             wf.setframerate(SAMPLE_RATE)
             wf.writeframes(b''.join(frames))
             wf.close()
@@ -423,30 +483,97 @@ class VoiceAssistant:
             "role": "user", "content": user_message
         })
 
+        # Build system prompt with memories
+        prompt = SYSTEM_PROMPT
+        if self.memories:
+            prompt += "\n\nThings you have been asked to remember:\n"
+            prompt += "\n".join(f"- {m}" for m in self.memories)
+
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT}
+            {"role": "system", "content": prompt}
         ] + self.conversation_history
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "remember",
+                    "description": "Save something to memory when the user asks you to remember it",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "fact": {"type": "string", "description": "The fact to remember"}
+                        },
+                        "required": ["fact"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "forget",
+                    "description": "Remove something from memory when the user asks you to forget it",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "fact": {"type": "string", "description": "The fact to forget (matched against existing memories)"}
+                        },
+                        "required": ["fact"]
+                    }
+                }
+            }
+        ]
 
         attempt_count = 0
 
         def call_gpt():
             nonlocal attempt_count
             attempt_count += 1
-            # M5: User feedback on retry
             if attempt_count == 2:
-                os.system(
-                    f'espeak -s 150 -v en-us --stdout "Hold on" 2>/dev/null '
-                    f'| aplay -D {self.device} 2>/dev/null'
-                )
+                if IS_MACOS:
+                    subprocess.run(["say", "Hold on"], stderr=subprocess.DEVNULL)
+                else:
+                    espeak = subprocess.Popen(
+                        ["espeak", "-s", "150", "-v", "en-us", "--stdout", "Hold on"],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+                    )
+                    subprocess.run(
+                        ["aplay", "-D", self.device],
+                        stdin=espeak.stdout, stderr=subprocess.DEVNULL
+                    )
+                    espeak.wait()
             return openai_client.chat.completions.create(
                 model="gpt-5.4-nano",
                 max_completion_tokens=200,
-                messages=messages
+                messages=messages,
+                tools=tools,
             )
 
         try:
             response = retry_api_call(call_gpt)
-            reply = response.choices[0].message.content
+            message = response.choices[0].message
+            reply = message.content or ""
+
+            # Handle tool calls (remember/forget)
+            if message.tool_calls:
+                for tool_call in message.tool_calls:
+                    args = json.loads(tool_call.function.arguments)
+                    if tool_call.function.name == "remember":
+                        fact = args["fact"]
+                        self._save_memory(fact)
+                        self.memories.append(fact)
+                        log.info(f"💾 Saved memory: {fact}")
+                        if not reply:
+                            reply = "Got it, I'll remember that!"
+                    elif tool_call.function.name == "forget":
+                        fact = args["fact"].lower()
+                        self.memories = [m for m in self.memories if fact not in m.lower()]
+                        os.makedirs(os.path.dirname(MEMORY_FILE), exist_ok=True)
+                        with open(MEMORY_FILE, 'w') as f:
+                            json.dump(self.memories, f, indent=2)
+                        log.info(f"🗑️ Forgot memory matching: {fact}")
+                        if not reply:
+                            reply = "Okay, I've forgotten that!"
 
             self.conversation_history.append({
                 "role": "assistant", "content": reply
@@ -481,7 +608,7 @@ class VoiceAssistant:
 
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 response.write_to_file(f.name)
-                os.system(f"aplay -D {self.device} {f.name} 2>/dev/null")
+                self._play_wav(f.name)
                 os.unlink(f.name)
             self.is_speaking = False
             return
@@ -510,19 +637,26 @@ class VoiceAssistant:
 
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                     f.write(response.audio_content)
-                    os.system(f"aplay -D {self.device} {f.name} 2>/dev/null")
+                    self._play_wav(f.name)
                     os.unlink(f.name)
                 self.is_speaking = False
                 return
             except Exception as e:
                 log.warning(f"Google TTS error: {e}, falling back to espeak")
 
-        # espeak fallback
-        clean = text.replace('"', '\\"').replace("'", "\\'")
-        os.system(
-            f'espeak -s 150 -v en-us --stdout "{clean}" 2>/dev/null '
-            f'| aplay -D {self.device} 2>/dev/null'
-        )
+        # espeak/say fallback (subprocess with list args — no shell injection)
+        if IS_MACOS:
+            subprocess.run(["say", text], stderr=subprocess.DEVNULL)
+        else:
+            espeak = subprocess.Popen(
+                ["espeak", "-s", "150", "-v", "en-us", "--stdout", text],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+            subprocess.run(
+                ["aplay", "-D", self.device],
+                stdin=espeak.stdout, stderr=subprocess.DEVNULL
+            )
+            espeak.wait()
         self.is_speaking = False
 
     def run(self):
@@ -609,7 +743,8 @@ class VoiceAssistant:
         except KeyboardInterrupt:
             log.info("\n\n👋 Shutting down...")
         finally:
-            self.audio.terminate()
+            if self.audio:
+                self.audio.terminate()
 
 
 if __name__ == "__main__":

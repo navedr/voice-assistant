@@ -4,3 +4,4 @@ __pycache__/
 gcp-*.json
 venv/
 .idea/
+data/

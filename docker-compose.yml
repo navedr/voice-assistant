@@ -9,12 +9,9 @@ services:
       - /dev/snd:/dev/snd
 
     # API Keys - set these in .env file or export before running
+    env_file: .env
     environment:
-      - GROQ_API_KEY=${GROQ_API_KEY}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - ASSISTANT_NAME=${ASSISTANT_NAME:-Beans}
       - AUDIO_DEVICE=${AUDIO_DEVICE:-}
-      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-key.json
 
     volumes:
       - ./gcp-key.json:/app/gcp-key.json:ro

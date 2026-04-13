@@ -2,3 +2,6 @@ pyaudio>=0.2.13
 groq>=0.4.0
 openai>=1.12.0
 google-cloud-texttospeech>=2.14.0
+python-dotenv>=1.0.0
+sounddevice>=0.4.6; sys_platform == "darwin"
+numpy>=1.24.0; sys_platform == "darwin"
