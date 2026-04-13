@@ -36,6 +36,12 @@ class CLIAssistant(VoiceAssistant):
     def flush_mic(self, duration=0.5):
         pass
 
+    def _play_wav(self, path):
+        pass
+
+    def _ensure_audio_cues(self):
+        pass
+
     def detect_wake_word(self):
         """Replace audio wake word detection with text input."""
         try:

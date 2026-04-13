@@ -9,8 +9,9 @@ import io
 import json
 import wave
 import time
+import urllib.request
+from datetime import datetime
 
-# Load .env file if present (for local development)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -26,10 +27,9 @@ from groq import Groq
 from openai import OpenAI
 from google.cloud import texttospeech
 
-# Audio input: pyaudio on Linux (Pi), sounddevice on macOS
 try:
     import pyaudio
-    import pyaudio._portaudio  # verify C module loads
+    import pyaudio._portaudio
     USE_SOUNDDEVICE = False
 except (ImportError, OSError):
     import sounddevice as sd
@@ -61,13 +61,38 @@ HISTORY_FILE = os.environ.get("HISTORY_FILE", "/app/data/history.json")
 MEMORY_FILE = os.environ.get("MEMORY_FILE", "/app/data/memory.json")
 MAX_HISTORY_PAIRS = 5
 
-# M4: Adaptive threshold constants
+# API timeouts
+API_TIMEOUT_STT = 15
+API_TIMEOUT_GPT = 20
+API_TIMEOUT_TTS = 15
+
+# Adaptive threshold
 MAX_WAKE_WORDS = 20
 NOISE_FLOOR_MIN = 150
 NOISE_FLOOR_MAX = 1500
 NOISE_FLOOR_MULTIPLIER = 1.5
 
-# Whisper hallucinates these on silence/noise
+# Weather
+WEATHER_LAT = os.environ.get("WEATHER_LAT", "33.9806")
+WEATHER_LON = os.environ.get("WEATHER_LON", "-118.1506")
+CONFIRMATION_ECHO = os.environ.get("CONFIRMATION_ECHO", "false").lower() == "true"
+
+WMO_CODES = {
+    0: "clear skies", 1: "mostly clear", 2: "partly cloudy", 3: "cloudy",
+    45: "foggy", 48: "foggy", 51: "light drizzle", 53: "drizzle",
+    55: "heavy drizzle", 61: "light rain", 63: "rain", 65: "heavy rain",
+    71: "light snow", 73: "snow", 75: "heavy snow", 80: "rain showers",
+    81: "heavy rain showers", 85: "snow showers", 95: "thunderstorms",
+}
+
+# Quiet hours
+QUIET_HOURS_ENABLED = os.environ.get("QUIET_HOURS_ENABLED", "false").lower() == "true"
+QUIET_HOURS_START = int(os.environ.get("QUIET_HOURS_START", "21"))
+QUIET_HOURS_END = int(os.environ.get("QUIET_HOURS_END", "7"))
+MAX_CRASH_RESTARTS = 5
+CRASH_COOLDOWN = 10
+
+# Whisper hallucinations
 HALLUCINATIONS = {
     "", ".", "..", "...", "thank you", "thanks", "thank you.", "thanks.",
     "you", "the", "bye", "bye.", "goodbye", "goodbye.", "okay", "okay.",
@@ -78,7 +103,6 @@ HALLUCINATIONS = {
     "subtitles by the amara.org community",
 }
 
-# M3: Cancel and exit phrases
 CANCEL_PHRASES = {
     "never mind", "nevermind", "cancel", "stop", "forget it", "nothing",
 }
@@ -87,7 +111,6 @@ EXIT_PHRASES = {
     "i'm done", "im done",
 }
 
-# M6: Kid-friendly system prompt
 SYSTEM_PROMPT = (
     f"You are {ASSISTANT_NAME}, a friendly voice assistant for kids. "
     "Use simple words a five-year-old can understand. "
@@ -97,13 +120,51 @@ SYSTEM_PROMPT = (
     "to something fun instead."
 )
 
-# M4: Fuzzy wake word variations
+# GPT tools
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "remember",
+        "description": "Save something to memory when the user asks you to remember it",
+        "parameters": {"type": "object", "properties": {
+            "fact": {"type": "string", "description": "The fact to remember"}
+        }, "required": ["fact"]}}},
+    {"type": "function", "function": {
+        "name": "forget",
+        "description": "Remove something from memory when the user asks you to forget it",
+        "parameters": {"type": "object", "properties": {
+            "fact": {"type": "string", "description": "The fact to forget"}
+        }, "required": ["fact"]}}},
+    {"type": "function", "function": {
+        "name": "set_timer",
+        "description": "Set a countdown timer. Convert spoken duration to seconds (e.g., '5 minutes' = 300).",
+        "parameters": {"type": "object", "properties": {
+            "duration_seconds": {"type": "integer", "description": "Timer duration in seconds"},
+            "label": {"type": "string", "description": "Name/label for the timer"}
+        }, "required": ["duration_seconds", "label"]}}},
+    {"type": "function", "function": {
+        "name": "check_timers",
+        "description": "Check active timers and time remaining.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "cancel_timer",
+        "description": "Cancel an active timer by name.",
+        "parameters": {"type": "object", "properties": {
+            "label": {"type": "string", "description": "Name of the timer to cancel"}
+        }, "required": ["label"]}}},
+    {"type": "function", "function": {
+        "name": "get_current_time",
+        "description": "Get current date and time. Call when user asks what time or day it is.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "get_weather",
+        "description": "Get current weather and forecast. Call when user asks about weather, temperature, or what to wear.",
+        "parameters": {"type": "object", "properties": {}}}},
+]
+
 def build_wake_variations(name):
     n = name.lower().strip()
     prefixes = ["hey", "hay", "a", "hey hey", "he"]
-    suffixes = list(dict.fromkeys(
-        s for s in [n, n[:-1], n + "s"] if s
-    ))
+    suffixes = list(dict.fromkeys(s for s in [n, n[:-1], n + "s"] if s))
     variations = set()
     for prefix in prefixes:
         for suffix in suffixes:
@@ -114,12 +175,10 @@ def build_wake_variations(name):
 
 WAKE_VARIATIONS = build_wake_variations(ASSISTANT_NAME)
 
-# Initialize clients
-groq_client = Groq(api_key=GROQ_API_KEY)
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY, timeout=API_TIMEOUT_STT)
+openai_client = OpenAI(api_key=OPENAI_API_KEY, timeout=API_TIMEOUT_GPT)
 
 
-# M5: Retry wrapper
 def retry_api_call(fn, max_retries=2, delay=1.0):
     last_exception = None
     current_delay = delay
@@ -164,8 +223,9 @@ class VoiceAssistant:
         self.last_interaction_time = time.time()
         self.current_threshold = SILENCE_THRESHOLD
         self.is_speaking = False
+        self.active_timers = []
+        self._ensure_audio_cues()
 
-        # Defer TTS client init
         try:
             self.tts_client = texttospeech.TextToSpeechClient()
         except Exception as e:
@@ -188,7 +248,6 @@ class VoiceAssistant:
 
     def _save_history(self):
         os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
-        # Keep last N pairs (2 messages per pair)
         history = self.conversation_history[-(MAX_HISTORY_PAIRS * 2):]
         with open(HISTORY_FILE, 'w') as f:
             json.dump(history, f, indent=2)
@@ -202,15 +261,50 @@ class VoiceAssistant:
         except (FileNotFoundError, json.JSONDecodeError):
             return []
 
-    def _save_memory(self, memory):
-        memories = self._load_memory()
-        memories.append(memory)
+    def _save_memory(self):
         os.makedirs(os.path.dirname(MEMORY_FILE), exist_ok=True)
         with open(MEMORY_FILE, 'w') as f:
-            json.dump(memories, f, indent=2)
+            json.dump(self.memories, f, indent=2)
+
+    def _generate_tone(self, freq_sequence, sample_rate=44100):
+        if not hasattr(self, "_tone_cache"):
+            self._tone_cache = {}
+        cache_key = tuple(freq_sequence)
+        if cache_key in self._tone_cache:
+            return self._tone_cache[cache_key]
+
+        samples = []
+        for freq_hz, duration_ms, pause_ms in freq_sequence:
+            n = int(sample_rate * duration_ms / 1000)
+            fade = min(n // 8, 200)
+            for i in range(n):
+                val = math.sin(2 * math.pi * freq_hz * i / sample_rate)
+                if i < fade:
+                    val *= i / fade
+                elif i > n - fade:
+                    val *= (n - i) / fade
+                samples.append(int(val * 16000))
+            samples.extend([0] * int(sample_rate * pause_ms / 1000))
+
+        f = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        wf = wave.open(f.name, "wb")
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(struct.pack(f"<{len(samples)}h", *samples))
+        wf.close()
+        f.close()
+        self._tone_cache[cache_key] = f.name
+        return f.name
+
+    def _ensure_audio_cues(self):
+        self._thinking_wav = self._generate_tone([(523, 100, 50), (659, 100, 0)])
+        self._error_wav = self._generate_tone([(330, 150, 50), (220, 150, 0)])
+        self._timer_alarm_wav = self._generate_tone([
+            (880, 150, 100), (880, 150, 100), (880, 150, 0)
+        ])
 
     def _open_mic(self):
-        """Open mic stream — returns (stream, read_fn, close_fn)."""
         if USE_SOUNDDEVICE:
             buffer = []
             def callback(indata, frames, time_info, status):
@@ -242,17 +336,17 @@ class VoiceAssistant:
 
     def _get_sample_width(self):
         if USE_SOUNDDEVICE:
-            return 2  # int16 = 2 bytes
+            return 2
         return self.audio.get_sample_size(pyaudio.paInt16)
 
     def _startup_self_test(self):
-        # Set USB speaker volume to max
-        try:
-            card = self.device.split(":")[1].split(",")[0] if ":" in self.device else "1"
-            subprocess.run(["amixer", "-c", card, "sset", "PCM", "90%"], capture_output=True)
-            log.info("🔊 Speaker volume set to max")
-        except Exception:
-            pass
+        if not IS_MACOS:
+            try:
+                card = self.device.split(":")[1].split(",")[0] if ":" in self.device else "1"
+                subprocess.run(["amixer", "-c", card, "sset", "PCM", "90%"], capture_output=True)
+                log.info("🔊 Speaker volume set to 90%")
+            except Exception:
+                pass
 
         try:
             _, read_fn, close_fn = self._open_mic()
@@ -264,7 +358,6 @@ class VoiceAssistant:
         self.speak(f"{ASSISTANT_NAME} is ready!")
 
     def flush_mic(self, duration=0.5):
-        """Discard buffered mic audio to prevent self-hearing."""
         try:
             _, read_fn, close_fn = self._open_mic()
             for _ in range(int(duration * SAMPLE_RATE / CHUNK_SIZE)):
@@ -275,9 +368,9 @@ class VoiceAssistant:
 
     def _play_wav(self, path):
         if IS_MACOS:
-            subprocess.run(["afplay", path], stderr=subprocess.DEVNULL)
+            subprocess.run(["afplay", path], stderr=subprocess.DEVNULL, timeout=10)
         else:
-            subprocess.run(["aplay", "-D", self.device, path], stderr=subprocess.DEVNULL)
+            subprocess.run(["aplay", "-D", self.device, path], stderr=subprocess.DEVNULL, timeout=10)
 
     def play_beep(self):
         self.is_speaking = True
@@ -291,7 +384,6 @@ class VoiceAssistant:
         sum_squares = sum(s ** 2 for s in shorts)
         return math.sqrt(sum_squares / count)
 
-    # M4: Adaptive noise calibration
     def calibrate_noise_floor(self, read_fn, duration=1.0):
         num_chunks = int(duration * SAMPLE_RATE / CHUNK_SIZE)
         total_rms = 0.0
@@ -302,20 +394,34 @@ class VoiceAssistant:
         threshold = NOISE_FLOOR_MULTIPLIER * avg_rms
         return int(max(NOISE_FLOOR_MIN, min(NOISE_FLOOR_MAX, threshold)))
 
-    # M4: Fuzzy wake word matching
     def is_wake_word(self, text):
         text = text.lower().strip()
         if len(text.split()) > MAX_WAKE_WORDS:
             return False
-        # Normalize punctuation so "hey, beans" matches "hey beans"
         normalized = text.replace(",", "").replace("!", "").replace(".", "")
         for check in (text, normalized):
             for variation in sorted(WAKE_VARIATIONS, key=len, reverse=True):
                 if variation in check:
-                    # Extract everything after the wake word
                     after = check.split(variation, 1)[1].strip().strip(".,!?")
                     return after if after else True
         return False
+
+    def _is_quiet_hours(self):
+        if not QUIET_HOURS_ENABLED:
+            return False
+        hour = datetime.now().hour
+        if QUIET_HOURS_START > QUIET_HOURS_END:
+            return hour >= QUIET_HOURS_START or hour < QUIET_HOURS_END
+        return QUIET_HOURS_START <= hour < QUIET_HOURS_END
+
+    def _check_expired_timers(self):
+        now = time.time()
+        expired = [t for t in self.active_timers if now >= t["end_time"]]
+        if expired:
+            self.active_timers = [t for t in self.active_timers if now < t["end_time"]]
+            for timer in expired:
+                self._play_wav(self._timer_alarm_wav)
+                self.speak(f"Time's up! Your {timer['label']} timer is done!")
 
     def detect_wake_word(self):
         try:
@@ -326,18 +432,16 @@ class VoiceAssistant:
             log.info(f"Audio device: {self.device}")
             return False
 
-        # M4: Adaptive threshold from ambient noise
         self.current_threshold = self.calibrate_noise_floor(read_fn, duration=1.0)
         log.info(f"👂 Listening (threshold: {self.current_threshold})")
 
-        pre_buffer = []  # Rolling buffer to capture audio before threshold crossed
-        pre_buffer_size = int(1.0 * SAMPLE_RATE / CHUNK_SIZE)  # ~1 second
+        pre_buffer = []
+        pre_buffer_size = int(1.0 * SAMPLE_RATE / CHUNK_SIZE)
         frames = []
         recording_started = False
         silence_frames = 0
         max_recording_frames = int(5 * SAMPLE_RATE / CHUNK_SIZE)
-
-        max_wait_frames = int(10 * SAMPLE_RATE / CHUNK_SIZE)  # Max 10s waiting for speech
+        max_wait_frames = int(10 * SAMPLE_RATE / CHUNK_SIZE)
 
         try:
             frame_count = 0
@@ -375,7 +479,6 @@ class VoiceAssistant:
         if not frames or len(frames) < 5:
             return False
 
-        # Transcribe with Groq (M5: with retry)
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             wf = wave.open(f.name, 'wb')
             wf.setnchannels(CHANNELS)
@@ -401,8 +504,6 @@ class VoiceAssistant:
                 if text in HALLUCINATIONS or len(text.strip(".,!? ")) < 3:
                     return False
                 log.info(f"Heard: {text}")
-
-                # M4: Fuzzy wake word check
                 return self.is_wake_word(text)
             except Exception as e:
                 log.warning(f"Transcription error: {e}")
@@ -445,7 +546,6 @@ class VoiceAssistant:
         if not frames or len(frames) < 5:
             return None
 
-        # Transcribe (M5: with retry)
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             wf = wave.open(f.name, 'wb')
             wf.setnchannels(CHANNELS)
@@ -478,51 +578,20 @@ class VoiceAssistant:
 
     def get_ai_response(self, user_message):
         log.info("🤖 Thinking...")
+        # Play thinking chime (non-blocking, cleaned up in except)
+        if IS_MACOS:
+            chime = subprocess.Popen(["afplay", self._thinking_wav], stderr=subprocess.DEVNULL)
+        else:
+            chime = subprocess.Popen(["aplay", "-D", self.device, self._thinking_wav], stderr=subprocess.DEVNULL)
 
-        self.conversation_history.append({
-            "role": "user", "content": user_message
-        })
+        self.conversation_history.append({"role": "user", "content": user_message})
 
-        # Build system prompt with memories
         prompt = SYSTEM_PROMPT
         if self.memories:
             prompt += "\n\nThings you have been asked to remember:\n"
             prompt += "\n".join(f"- {m}" for m in self.memories)
 
-        messages = [
-            {"role": "system", "content": prompt}
-        ] + self.conversation_history
-
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "remember",
-                    "description": "Save something to memory when the user asks you to remember it",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "fact": {"type": "string", "description": "The fact to remember"}
-                        },
-                        "required": ["fact"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "forget",
-                    "description": "Remove something from memory when the user asks you to forget it",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "fact": {"type": "string", "description": "The fact to forget (matched against existing memories)"}
-                        },
-                        "required": ["fact"]
-                    }
-                }
-            }
-        ]
+        messages = [{"role": "system", "content": prompt}] + self.conversation_history
 
         attempt_count = 0
 
@@ -531,22 +600,20 @@ class VoiceAssistant:
             attempt_count += 1
             if attempt_count == 2:
                 if IS_MACOS:
-                    subprocess.run(["say", "Hold on"], stderr=subprocess.DEVNULL)
+                    subprocess.run(["say", "Hold on"], stderr=subprocess.DEVNULL, timeout=10)
                 else:
                     espeak = subprocess.Popen(
                         ["espeak", "-s", "150", "-v", "en-us", "--stdout", "Hold on"],
                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
                     )
-                    subprocess.run(
-                        ["aplay", "-D", self.device],
-                        stdin=espeak.stdout, stderr=subprocess.DEVNULL
-                    )
-                    espeak.wait()
+                    subprocess.run(["aplay", "-D", self.device],
+                                   stdin=espeak.stdout, stderr=subprocess.DEVNULL)
+                    espeak.wait(timeout=10)
             return openai_client.chat.completions.create(
                 model="gpt-5.4-nano",
                 max_completion_tokens=200,
                 messages=messages,
-                tools=tools,
+                tools=TOOLS,
             )
 
         try:
@@ -554,32 +621,96 @@ class VoiceAssistant:
             message = response.choices[0].message
             reply = message.content or ""
 
-            # Handle tool calls (remember/forget)
             if message.tool_calls:
-                for tool_call in message.tool_calls:
-                    args = json.loads(tool_call.function.arguments)
-                    if tool_call.function.name == "remember":
+                for tc in message.tool_calls:
+                    args = json.loads(tc.function.arguments)
+                    name = tc.function.name
+
+                    if name == "remember":
                         fact = args["fact"]
-                        self._save_memory(fact)
                         self.memories.append(fact)
+                        self._save_memory()
                         log.info(f"💾 Saved memory: {fact}")
                         if not reply:
                             reply = "Got it, I'll remember that!"
-                    elif tool_call.function.name == "forget":
+
+                    elif name == "forget":
                         fact = args["fact"].lower()
                         self.memories = [m for m in self.memories if fact not in m.lower()]
-                        os.makedirs(os.path.dirname(MEMORY_FILE), exist_ok=True)
-                        with open(MEMORY_FILE, 'w') as f:
-                            json.dump(self.memories, f, indent=2)
+                        self._save_memory()
                         log.info(f"🗑️ Forgot memory matching: {fact}")
                         if not reply:
                             reply = "Okay, I've forgotten that!"
 
-            self.conversation_history.append({
-                "role": "assistant", "content": reply
-            })
+                    elif name == "set_timer":
+                        label = args.get("label", "timer")
+                        duration = args["duration_seconds"]
+                        self.active_timers.append({"label": label, "end_time": time.time() + duration})
+                        log.info(f"⏱️ Timer set: {label} for {duration}s")
+                        if not reply:
+                            reply = f"Timer set for {label}!"
 
-            # Keep last N pairs
+                    elif name == "check_timers":
+                        if self.active_timers:
+                            now = time.time()
+                            parts = []
+                            for t in self.active_timers:
+                                remaining = int(t["end_time"] - now)
+                                mins, secs = divmod(max(remaining, 0), 60)
+                                if mins > 0:
+                                    parts.append(f"{t['label']}: {mins} minutes {secs} seconds left")
+                                else:
+                                    parts.append(f"{t['label']}: {secs} seconds left")
+                            reply = ". ".join(parts)
+                        else:
+                            reply = "No timers running."
+
+                    elif name == "cancel_timer":
+                        label = args.get("label", "").lower()
+                        before = len(self.active_timers)
+                        self.active_timers = [t for t in self.active_timers if t["label"].lower() != label]
+                        if len(self.active_timers) < before:
+                            log.info(f"⏱️ Timer cancelled: {label}")
+                            if not reply:
+                                reply = "Timer cancelled!"
+                        elif not reply:
+                            reply = f"I don't see a timer called {label}."
+
+                    elif name == "get_current_time":
+                        now = datetime.now()
+                        if not reply:
+                            reply = now.strftime("It's %I:%M %p on %A, %B %d.")
+
+                    elif name == "get_weather":
+                        try:
+                            url = (
+                                f"https://api.open-meteo.com/v1/forecast?"
+                                f"latitude={WEATHER_LAT}&longitude={WEATHER_LON}"
+                                f"&current=temperature_2m,weather_code,wind_speed_10m"
+                                f"&daily=temperature_2m_max,temperature_2m_min,weather_code"
+                                f"&temperature_unit=fahrenheit&wind_speed_unit=mph"
+                                f"&timezone=auto&forecast_days=2"
+                            )
+                            resp = urllib.request.urlopen(url, timeout=5)
+                            data = json.loads(resp.read().decode())
+                            current = data["current"]
+                            daily = data["daily"]
+                            temp = round(current["temperature_2m"])
+                            desc = WMO_CODES.get(current["weather_code"], "unknown conditions")
+                            high = round(daily["temperature_2m_max"][0])
+                            low = round(daily["temperature_2m_min"][0])
+                            if not reply:
+                                reply = (
+                                    f"Right now it's {temp} degrees with {desc}. "
+                                    f"Today's high is {high} and low is {low} degrees."
+                                )
+                        except Exception as e:
+                            log.warning(f"Weather API error: {e}")
+                            if not reply:
+                                reply = "I couldn't check the weather right now."
+
+            self.conversation_history.append({"role": "assistant", "content": reply})
+
             if len(self.conversation_history) > MAX_HISTORY_PAIRS * 2:
                 self.conversation_history = self.conversation_history[-(MAX_HISTORY_PAIRS * 2):]
             self._save_history()
@@ -588,24 +719,22 @@ class VoiceAssistant:
             return reply
         except Exception as e:
             log.warning(f"AI error: {e}")
+            chime.wait(timeout=2)
+            self._play_wav(self._error_wav)
             return "I'm having trouble connecting right now."
 
     def speak(self, text):
         log.info(f"🔊 Speaking: {text}")
         self.is_speaking = True
 
-        # Try Groq TTS first (fastest)
         try:
             def call_groq_tts():
                 return groq_client.audio.speech.create(
                     model="canopylabs/orpheus-v1-english",
-                    voice="hannah",
-                    input=text,
-                    response_format="wav"
+                    voice="hannah", input=text, response_format="wav"
                 )
 
             response = retry_api_call(call_groq_tts)
-
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 response.write_to_file(f.name)
                 self._play_wav(f.name)
@@ -615,7 +744,6 @@ class VoiceAssistant:
         except Exception as e:
             log.warning(f"Groq TTS error: {e}, trying Google TTS")
 
-        # Google Cloud TTS fallback
         if self.tts_client:
             try:
                 synthesis_input = texttospeech.SynthesisInput(text=text)
@@ -630,11 +758,10 @@ class VoiceAssistant:
                 def call_google_tts():
                     return self.tts_client.synthesize_speech(
                         input=synthesis_input, voice=voice,
-                        audio_config=audio_config
+                        audio_config=audio_config, timeout=API_TIMEOUT_TTS
                     )
 
                 response = retry_api_call(call_google_tts)
-
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                     f.write(response.audio_content)
                     self._play_wav(f.name)
@@ -644,19 +771,16 @@ class VoiceAssistant:
             except Exception as e:
                 log.warning(f"Google TTS error: {e}, falling back to espeak")
 
-        # espeak/say fallback (subprocess with list args — no shell injection)
         if IS_MACOS:
-            subprocess.run(["say", text], stderr=subprocess.DEVNULL)
+            subprocess.run(["say", text], stderr=subprocess.DEVNULL, timeout=30)
         else:
             espeak = subprocess.Popen(
                 ["espeak", "-s", "150", "-v", "en-us", "--stdout", text],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
             )
-            subprocess.run(
-                ["aplay", "-D", self.device],
-                stdin=espeak.stdout, stderr=subprocess.DEVNULL
-            )
-            espeak.wait()
+            subprocess.run(["aplay", "-D", self.device],
+                           stdin=espeak.stdout, stderr=subprocess.DEVNULL)
+            espeak.wait(timeout=10)
         self.is_speaking = False
 
     def run(self):
@@ -666,95 +790,105 @@ class VoiceAssistant:
         log.info("Press Ctrl+C to exit")
         log.info("=" * 50 + "\n")
 
-        try:
-            while True:
-                # M2: Session timeout — clear stale history
-                if time.time() - self.last_interaction_time > 300:
-                    if self.conversation_history:
-                        log.info("Session timeout — clearing conversation history")
-                        self.conversation_history = []
-                        self._save_history()
+        while True:
+            # Session timeout
+            if time.time() - self.last_interaction_time > 300:
+                if self.conversation_history:
+                    log.info("Session timeout — clearing conversation history")
+                    self.conversation_history = []
+                    self._save_history()
 
-                result = self.detect_wake_word()
-                if result:
-                    if isinstance(result, str):
-                        # Inline command — beep and go straight to GPT
-                        self.play_beep()
-                        command = result
-                    else:
-                        # Wake word only — beep, then listen
-                        self.play_beep()
-                        command = self.record_command()
+            # Check expired timers
+            self._check_expired_timers()
 
-                    if command:
-                        # M3: Check cancel phrases
-                        if command.lower().strip().strip(".,!?") in CANCEL_PHRASES:
+            result = self.detect_wake_word()
+
+            # Quiet hours
+            if result and self._is_quiet_hours():
+                log.info("Quiet hours — ignoring wake word")
+                continue
+
+            if result:
+                if isinstance(result, str):
+                    self.play_beep()
+                    command = result
+                else:
+                    self.play_beep()
+                    command = self.record_command()
+
+                if CONFIRMATION_ECHO and command:
+                    self.speak(f"I heard: {command}")
+
+                if command:
+                    if command.lower().strip().strip(".,!?") in CANCEL_PHRASES:
+                        self.speak("Okay!")
+                        self.last_interaction_time = time.time()
+                        continue
+
+                    self.last_interaction_time = time.time()
+                    response = self.get_ai_response(command)
+                    self.speak(response)
+
+                    # Conversation mode
+                    while True:
+                        self.flush_mic()
+                        log.info("👂 Listening for follow-up...")
+                        follow_up = self.record_command(max_seconds=8)
+
+                        if not follow_up:
+                            log.info("No follow-up, returning to wake word")
+                            break
+
+                        follow_lower = follow_up.lower().strip().strip(".,!?")
+
+                        if follow_lower in EXIT_PHRASES:
+                            self.speak("Talk to you later!")
+                            self.last_interaction_time = time.time()
+                            break
+
+                        if follow_lower in CANCEL_PHRASES:
                             self.speak("Okay!")
                             self.last_interaction_time = time.time()
-                            continue
+                            break
+
+                        if follow_lower in HALLUCINATIONS or len(follow_lower.strip(".,!? ")) < 3:
+                            break
+
+                        wake_result = self.is_wake_word(follow_lower)
+                        if wake_result is not False:
+                            if isinstance(wake_result, str):
+                                follow_up = wake_result
+                            else:
+                                continue
 
                         self.last_interaction_time = time.time()
-                        response = self.get_ai_response(command)
+                        response = self.get_ai_response(follow_up)
                         self.speak(response)
-
-                        # M2: Conversation mode — listen for follow-ups
-                        while True:
-                            self.flush_mic()  # Discard echo of TTS playback
-                            log.info("👂 Listening for follow-up (5s)...")
-                            follow_up = self.record_command(max_seconds=8)
-
-                            if not follow_up:
-                                log.info("No follow-up, returning to wake word")
-                                break
-
-                            follow_lower = follow_up.lower().strip().strip(".,!?")
-
-                            # M3: Exit phrases end conversation mode
-                            if follow_lower in EXIT_PHRASES:
-                                self.speak("Talk to you later!")
-                                self.last_interaction_time = time.time()
-                                break
-
-                            # M3: Cancel phrases end conversation mode
-                            if follow_lower in CANCEL_PHRASES:
-                                self.speak("Okay!")
-                                self.last_interaction_time = time.time()
-                                break
-
-                            # Filter hallucinations in follow-up
-                            if follow_lower in HALLUCINATIONS or len(follow_lower.strip(".,!? ")) < 3:
-                                break
-
-                            # Handle wake word said during follow-up
-                            wake_result = self.is_wake_word(follow_lower)
-                            if wake_result is not False:
-                                if isinstance(wake_result, str):
-                                    follow_up = wake_result
-                                else:
-                                    continue  # Just wake word, keep listening
-
-                            self.last_interaction_time = time.time()
-                            response = self.get_ai_response(follow_up)
-                            self.speak(response)
-                    else:
-                        # M3: Friendlier message
-                        self.speak("I'm here if you need me!")
-
-        except KeyboardInterrupt:
-            log.info("\n\n👋 Shutting down...")
-        finally:
-            if self.audio:
-                self.audio.terminate()
+                else:
+                    self.speak("I'm here if you need me!")
 
 
 if __name__ == "__main__":
     if not GROQ_API_KEY:
         log.error("GROQ_API_KEY not set")
         exit(1)
-
     if not OPENAI_API_KEY:
         log.error("OPENAI_API_KEY not set")
         exit(1)
 
-    assistant = VoiceAssistant()
-    assistant.run()
+    for restart in range(MAX_CRASH_RESTARTS):
+        try:
+            assistant = VoiceAssistant()
+            if restart > 0:
+                assistant.speak("I had a hiccup, but I'm back!")
+            assistant.run()
+            break
+        except KeyboardInterrupt:
+            log.info("\n\n👋 Shutting down...")
+            break
+        except Exception as e:
+            log.error(f"Crash #{restart + 1}: {e}")
+            if restart < MAX_CRASH_RESTARTS - 1:
+                time.sleep(CRASH_COOLDOWN)
+    else:
+        log.error("Too many crashes, giving up")
